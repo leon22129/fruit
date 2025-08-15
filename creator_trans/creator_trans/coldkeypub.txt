@@ -1,0 +1,1 @@
+{"ss58Address":"5EFg2VJW4Emwp8wbRsTcB7km3iqZotTbD2wUZNmYa2dQqG4Z","accountId":"0x60d600f2caf1c8f093cfec57cf85ac54ebf5b8dcf86d9209fd2463c45ea71953","publicKey":"0x60d600f2caf1c8f093cfec57cf85ac54ebf5b8dcf86d9209fd2463c45ea71953"}

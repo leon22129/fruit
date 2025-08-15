@@ -1,173 +1,232 @@
-# The MIT License (MIT)
-# Copyright © 2023 Yuma Rao
-# TODO(developer): Set your name
-# Copyright © 2023 <your name>
-
-# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
-# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
-# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
-# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
-# the Software.
-
-# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
-# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
-# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-# DEALINGS IN THE SOFTWARE.
-
-import time
-import typing
+from FruitsMaturityNet.base.miner import BaseMinerNeuron
 import bittensor as bt
+import argparse
+import torch
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
+import torch.nn.functional as F
+import torch.optim as optim
+from torch import Tensor
+from PIL import Image
+import io
+import os
+import time
+import threading
+from collections import OrderedDict, deque
+from typing import cast, Tuple
 
-# Bittensor Miner Template:
-import template
-
-# import base miner class which takes care of most of the boilerplate
-from template.base.miner import BaseMinerNeuron
+from FruitsMaturityNet.protocol import FruitPrediction, FeedbackSynapse
+from FruitsMaturityNet.model import FruitClassifier, FRUIT_TYPE_MAP, RIPENESS_MAP, NUM_FRUIT_TYPES, NUM_RIPENESS_LEVELS
+from FruitsMaturityNet.dataset import FruitDataset, FeedbackDataset
 
 
 class Miner(BaseMinerNeuron):
-    """
-    Your miner neuron class. You should use this class to define your miner's behavior. In particular, you should replace the forward function with your own logic. You may also want to override the blacklist and priority functions according to your needs.
-
-    This class inherits from the BaseMinerNeuron class, which in turn inherits from BaseNeuron. The BaseNeuron class takes care of routine tasks such as setting up wallet, subtensor, metagraph, logging directory, parsing config, etc. You can override any of the methods in BaseNeuron if you need to customize the behavior.
-
-    This class provides reasonable default behavior for a miner such as blacklisting unrecognized hotkeys, prioritizing requests based on stake, and forwarding requests to the forward function. If you need to define custom
-    """
-
     def __init__(self, config=None):
         super(Miner, self).__init__(config=config)
 
-        # TODO(developer): Anything specific to your use case you can do here
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        bt.logging.info(f"Using device: {self.device}")
 
-    async def forward(
-        self, synapse: template.protocol.Dummy
-    ) -> template.protocol.Dummy:
-        """
-        Processes the incoming 'Dummy' synapse by performing a predefined operation on the input data.
-        This method should be replaced with actual logic relevant to the miner's purpose.
+        # Model
+        self.model = FruitClassifier(NUM_FRUIT_TYPES, NUM_RIPENESS_LEVELS).to(self.device)
+        self.model_lock = threading.Lock()
 
-        Args:
-            synapse (template.protocol.Dummy): The synapse object containing the 'dummy_input' data.
+        # Paths
+        self.dataset_root = os.path.join(os.getcwd(), "dataset")
+        self.feedback_dataset_root = os.path.join(os.getcwd(), "data", "feedback_dataset")
+        os.makedirs(self.feedback_dataset_root, exist_ok=True)
+        self.model_path = os.path.join(os.getcwd(), "fruit_model.pth")
 
-        Returns:
-            template.protocol.Dummy: The synapse object with the 'dummy_output' field set to twice the 'dummy_input' value.
+        # Buffers
+        self.feedback_buffer: deque[Tuple[bytes, str, str]] = deque(maxlen=1000)
+        self.image_cache = OrderedDict()
+        self.cache_max_size = 1000
 
-        The 'forward' function is a placeholder and should be overridden with logic that is appropriate for
-        the miner's intended operation. This method demonstrates a basic transformation of input data.
-        """
-        # TODO(developer): Replace with actual implementation logic.
-        synapse.dummy_output = synapse.dummy_input * 2
+        # Transform
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+        # Load or offline train
+        if os.path.exists(self.model_path):
+            self.load_model()
+        else:
+            bt.logging.info("No saved model found. Training offline...")
+            self.offline_train()
+            self.save_model()
+
+        # Background fine-tuning
+        # self.training_thread = threading.Thread(target=self.background_loop, daemon=True)
+        # self.training_thread.start()
+
+        self.axon = bt.axon(wallet=self.wallet, port=self.config.axon.port)
+        # Attach endpoints
+        self.axon.attach(
+            forward_fn=self.predict_fruit
+        ).attach(
+            forward_fn=self.receive_feedback
+        )
+
+    # ----------------------------
+    # Save / Load model
+    # ----------------------------
+    def save_model(self):
+        torch.save(self.model.state_dict(), self.model_path)
+        bt.logging.info(f"Model saved to {self.model_path}")
+
+    def load_model(self):
+        self.model.load_state_dict(torch.load(self.model_path, map_location=self.device))
+        bt.logging.info(f"Loaded model from {self.model_path}")
+
+    # ----------------------------
+    # Offline training
+    # ----------------------------
+    def offline_train(self, epochs: int = 5):
+        dataset = FruitDataset(root_dir=self.dataset_root, train=True, transform=self.transform)
+        dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+        self.train_model(self.model, dataloader, epochs=epochs, lr=1e-4)
+
+    def train_model(self, model, dataloader, epochs=1, lr=1e-4):
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+        model.train()
+        for epoch in range(epochs):
+            total_loss = 0
+            for batch in dataloader:
+                images = batch["image"].to(self.device)
+                ft_labels = batch["fruit_type_label"].to(self.device)
+                rp_labels = batch["ripeness_label"].to(self.device)
+
+                optimizer.zero_grad()
+                outputs = model(images)
+                loss_ft = F.cross_entropy(outputs["fruit_type_logits"], ft_labels)
+                loss_rp = F.cross_entropy(outputs["ripeness_logits"], rp_labels)
+                loss = loss_ft + loss_rp
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+
+            bt.logging.info(f"Epoch {epoch+1}/{epochs} - Loss: {total_loss/len(dataloader):.4f}")
+            print(f"Epoch {epoch+1}/{epochs} - Loss: {total_loss/len(dataloader):.4f}")
+
+    # ----------------------------
+    # Background loop
+    # ----------------------------
+    def background_loop(self):
+        while True:
+            if len(self.feedback_buffer) >= 1000:
+                bt.logging.info(f"Fine-tuning with {len(self.feedback_buffer)} feedback samples...")
+                feedback_list = list(self.feedback_buffer)
+                self.feedback_buffer.clear()
+
+                # Save feedback to permanent dataset
+                for idx, (img_bytes, ft, rp) in enumerate(feedback_list):
+                    img_name = f"{time.time()}_{idx}.jpg"
+                    label_file = img_name.replace(".jpg", ".txt")
+                    with open(os.path.join(self.feedback_dataset_root, img_name), "wb") as f:
+                        f.write(img_bytes)
+                    with open(os.path.join(self.feedback_dataset_root, label_file), "w") as f:
+                        f.write(f"{ft},{rp}")
+
+                # Fine-tune
+                feedback_dataset = FeedbackDataset([
+                    {"image_bytes": img, "true_fruit_type": ft, "true_ripeness": rp}
+                    for img, ft, rp in feedback_list
+                ], transform=self.transform)
+                loader = DataLoader(feedback_dataset, batch_size=16, shuffle=True)
+
+                with self.model_lock:
+                    self.train_model(self.model, loader, epochs=1, lr=1e-5)
+                    self.save_model()
+
+                bt.logging.info("Fine-tuning complete. Weights saved.")
+
+            time.sleep(5)
+
+    # ----------------------------
+    # Prediction
+    # ----------------------------
+    def predict_fruit(self, synapse: FruitPrediction) -> FruitPrediction:
+        try:
+            img_bytes = synapse.decode_image()
+            if not img_bytes:
+                synapse.fruit_type_prediction = "Error: No image"
+                synapse.ripeness_prediction = "Error: No image"
+                return synapse
+
+            # Cache for feedback
+            self.image_cache[synapse.request_id] = img_bytes
+            if len(self.image_cache) > self.cache_max_size:
+                self.image_cache.popitem(last=False)
+
+            image = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+            tensor = cast(Tensor, self.transform(image)).unsqueeze(0).to(self.device)
+
+            with self.model_lock:
+                self.model.eval()
+                with torch.no_grad():
+                    outputs = self.model(tensor)
+                    ft_id = torch.argmax(outputs["fruit_type_logits"], dim=1).item()
+                    rp_id = torch.argmax(outputs["ripeness_logits"], dim=1).item()
+                    synapse.fruit_type_prediction = FRUIT_TYPE_MAP.get(ft_id, "Unknown")
+                    synapse.ripeness_prediction = RIPENESS_MAP.get(rp_id, "Unknown")
+
+        except Exception as e:
+            bt.logging.error(f"Prediction error: {e}")
         return synapse
 
-    async def blacklist(
-        self, synapse: template.protocol.Dummy
-    ) -> typing.Tuple[bool, str]:
-        """
-        Determines whether an incoming request should be blacklisted and thus ignored. Your implementation should
-        define the logic for blacklisting requests based on your needs and desired security parameters.
-
-        Blacklist runs before the synapse data has been deserialized (i.e. before synapse.data is available).
-        The synapse is instead contracted via the headers of the request. It is important to blacklist
-        requests before they are deserialized to avoid wasting resources on requests that will be ignored.
-
-        Args:
-            synapse (template.protocol.Dummy): A synapse object constructed from the headers of the incoming request.
-
-        Returns:
-            Tuple[bool, str]: A tuple containing a boolean indicating whether the synapse's hotkey is blacklisted,
-                            and a string providing the reason for the decision.
-
-        This function is a security measure to prevent resource wastage on undesired requests. It should be enhanced
-        to include checks against the metagraph for entity registration, validator status, and sufficient stake
-        before deserialization of synapse data to minimize processing overhead.
-
-        Example blacklist logic:
-        - Reject if the hotkey is not a registered entity within the metagraph.
-        - Consider blacklisting entities that are not validators or have insufficient stake.
-
-        In practice it would be wise to blacklist requests from entities that are not validators, or do not have
-        enough stake. This can be checked via metagraph.S and metagraph.validator_permit. You can always attain
-        the uid of the sender via a metagraph.hotkeys.index( synapse.dendrite.hotkey ) call.
-
-        Otherwise, allow the request to be processed further.
-        """
-
-        if synapse.dendrite is None or synapse.dendrite.hotkey is None:
-            bt.logging.warning(
-                "Received a request without a dendrite or hotkey."
-            )
-            return True, "Missing dendrite or hotkey"
-
-        # TODO(developer): Define how miners should blacklist requests.
-        uid = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
-        if (
-            not self.config.blacklist.allow_non_registered
-            and synapse.dendrite.hotkey not in self.metagraph.hotkeys
-        ):
-            # Ignore requests from un-registered entities.
-            bt.logging.trace(
-                f"Blacklisting un-registered hotkey {synapse.dendrite.hotkey}"
-            )
-            return True, "Unrecognized hotkey"
-
-        if self.config.blacklist.force_validator_permit:
-            # If the config is set to force validator permit, then we should only allow requests from validators.
-            if not self.metagraph.validator_permit[uid]:
-                bt.logging.warning(
-                    f"Blacklisting a request from non-validator hotkey {synapse.dendrite.hotkey}"
-                )
-                return True, "Non-validator hotkey"
-
-        bt.logging.trace(
-            f"Not Blacklisting recognized hotkey {synapse.dendrite.hotkey}"
-        )
-        return False, "Hotkey recognized!"
-
-    async def priority(self, synapse: template.protocol.Dummy) -> float:
-        """
-        The priority function determines the order in which requests are handled. More valuable or higher-priority
-        requests are processed before others. You should design your own priority mechanism with care.
-
-        This implementation assigns priority to incoming requests based on the calling entity's stake in the metagraph.
-
-        Args:
-            synapse (template.protocol.Dummy): The synapse object that contains metadata about the incoming request.
-
-        Returns:
-            float: A priority score derived from the stake of the calling entity.
-
-        Miners may receive messages from multiple entities at once. This function determines which request should be
-        processed first. Higher values indicate that the request should be processed first. Lower values indicate
-        that the request should be processed later.
-
-        Example priority logic:
-        - A higher stake results in a higher priority value.
-        """
-        if synapse.dendrite is None or synapse.dendrite.hotkey is None:
-            bt.logging.warning(
-                "Received a request without a dendrite or hotkey."
-            )
-            return 0.0
-
-        # TODO(developer): Define how miners should prioritize requests.
-        caller_uid = self.metagraph.hotkeys.index(
-            synapse.dendrite.hotkey
-        )  # Get the caller index.
-        priority = float(
-            self.metagraph.S[caller_uid]
-        )  # Return the stake as the priority.
-        bt.logging.trace(
-            f"Prioritizing {synapse.dendrite.hotkey} with value: {priority}"
-        )
-        return priority
+    # ----------------------------
+    # Feedback
+    # ----------------------------
+    def receive_feedback(self, synapse: FeedbackSynapse) -> FeedbackSynapse:
+        img_bytes = self.image_cache.get(synapse.request_id)
+        if img_bytes:
+            self.feedback_buffer.append((img_bytes, synapse.true_fruit_type, synapse.true_ripeness))
+            bt.logging.info(f"Feedback added. Buffer size: {len(self.feedback_buffer)}")
+        else:
+            bt.logging.warning(f"No image found for feedback {synapse.request_id}")
+        return synapse
 
 
-# This is the main function, which runs the miner.
 if __name__ == "__main__":
+    # with Miner() as miner:
+    #     bt.logging.info("Running miner on subnet %d"%miner.config.netuid)
+    #     last_block = 0
+    #     while True:
+    #         if miner.block % 5 == 0 and miner.block > last_block:
+    #             log = (
+    #                 f"Block: {miner.block} | " +
+    #                 "Stake:%.02f | "%(miner.metagraph.S[miner.uid]) +
+    #                 "Rank:%.04f | "%miner.metagraph.R[miner.uid] +
+    #                 "Trust:%.04f | "%miner.metagraph.T[miner.uid] +
+    #                 "Consensus:%.04f | "%miner.metagraph.C[miner.uid] +
+    #                 "Incentive:%.04f | "%miner.metagraph.I[miner.uid] +
+    #                 "Emission:%.04f"%miner.metagraph.E[miner.uid]
+    #             )
+    #             bt.logging.info(log)
+    #         last_block = miner.block
+    #         # bt.logging.info("Miner running...", time.time())
+    #         time.sleep(5)
+
     with Miner() as miner:
+        bt.logging.info(f"Running miner on subnet {miner.config.netuid}")
+        last_block = 0
         while True:
-            bt.logging.info(f"Miner running... {time.time()}")
+            block = getattr(miner, "cached_block", None)
+            metrics = getattr(miner, "cached_metrics", None)
+
+            if block and block % 5 == 0 and block > last_block and metrics:
+                log = (
+                    f"Block: {block} | "
+                    f"Stake:{metrics['stake']:.02f} | "
+                    f"Rank:{metrics['rank']:.04f} | "
+                    f"Trust:{metrics['trust']:.04f} | "
+                    f"Consensus:{metrics['consensus']:.04f} | "
+                    f"Incentive:{metrics['incentive']:.04f} | "
+                    f"Emission:{metrics['emission']:.04f}"
+                )
+                bt.logging.info(log)
+                last_block = block
+
             time.sleep(5)
