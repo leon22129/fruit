@@ -22,6 +22,7 @@ import copy
 import numpy as np
 import asyncio
 import argparse
+import torch
 import threading
 import bittensor as bt
 
@@ -225,22 +226,24 @@ class BaseValidatorNeuron(BaseNeuron):
         """
 
         # Check if self.scores contains any NaN values and log a warning if it does.
-        if np.isnan(self.scores).any():
+        scores = self.scores.cpu().numpy() if isinstance(self.scores, torch.Tensor) else self.scores
+
+        if np.isnan(scores).any():
             bt.logging.warning(
-                f"Scores contain NaN values. This may be due to a lack of responses from miners, or a bug in your reward functions."
+                "Scores contain NaN values. This may be due to a lack of responses from miners, or a bug in your reward functions."
             )
 
         # Calculate the average reward for each uid across non-zero values.
         # Replace any NaN values with 0.
         # Compute the norm of the scores
-        norm = np.linalg.norm(self.scores, ord=1, axis=0, keepdims=True)
+        norm = np.linalg.norm(scores, ord=1, axis=0, keepdims=True)
 
         # Check if the norm is zero or contains NaN values
         if np.any(norm == 0) or np.isnan(norm).any():
             norm = np.ones_like(norm)  # Avoid division by zero or NaN
 
         # Compute raw_weights safely
-        raw_weights = self.scores / norm
+        raw_weights = scores / norm
 
         bt.logging.debug("raw_weights", raw_weights)
         bt.logging.debug("raw_weight_uids", str(self.metagraph.uids.tolist()))
@@ -368,11 +371,15 @@ class BaseValidatorNeuron(BaseNeuron):
         """Saves the state of the validator to a file."""
         bt.logging.info("Saving validator state.")
 
+        scores_to_save = (
+            self.scores.cpu().numpy() if isinstance(self.scores, torch.Tensor) else self.scores
+        )
+
         # Save the state of the validator to file.
         np.savez(
             self.config.neuron.full_path + "/state.npz",
             step=self.step,
-            scores=self.scores,
+            scores=scores_to_save,
             hotkeys=self.hotkeys,
         )
 

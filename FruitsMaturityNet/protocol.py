@@ -40,6 +40,17 @@ class FruitPrediction(bt.Synapse):
         if self.image:
             return base64.b64decode(self.image)
         return None
+    
+    @classmethod
+    def from_dict(cls, data: dict):
+        """Create a FruitPrediction object from a dictionary."""
+        obj = cls()
+        obj.request_id = data.get("request_id", "")
+        obj.fruit_type_prediction = data.get("fruit_type_prediction")
+        obj.ripeness_prediction = data.get("ripeness_prediction")
+        obj.fruit_type_confidence = data.get("fruit_type_confidence")
+        obj.ripeness_confidence = data.get("ripeness_confidence")
+        return obj
 
 class FeedbackSynapse(bt.Synapse):
     """

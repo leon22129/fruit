@@ -1,5 +1,6 @@
-bittensor>=6.0.0
+bittensor==9.9.0
 torch>=2.0
 torchvision
 kaggle
 pillow
+timm>=1.0.9

@@ -58,8 +58,8 @@ class Miner(BaseMinerNeuron):
             self.save_model()
 
         # Background fine-tuning
-        # self.training_thread = threading.Thread(target=self.background_loop, daemon=True)
-        # self.training_thread.start()
+        self.training_thread = threading.Thread(target=self.background_loop, daemon=True)
+        self.training_thread.start()
 
         self.axon = bt.axon(wallet=self.wallet, port=self.config.axon.port)
         # Attach endpoints
@@ -115,13 +115,20 @@ class Miner(BaseMinerNeuron):
     # ----------------------------
     def background_loop(self):
         while True:
-            if len(self.feedback_buffer) >= 1000:
+            if len(self.feedback_buffer) >= 5:
                 bt.logging.info(f"Fine-tuning with {len(self.feedback_buffer)} feedback samples...")
                 feedback_list = list(self.feedback_buffer)
                 self.feedback_buffer.clear()
 
+                valid_feedback = []
+
                 # Save feedback to permanent dataset
                 for idx, (img_bytes, ft, rp) in enumerate(feedback_list):
+                    if not ft or not rp:
+                        bt.logging.warning(f"Skipping invalid feedback: {ft}, {rp}")
+                        continue
+
+                    # save feedback to permanent dataset
                     img_name = f"{time.time()}_{idx}.jpg"
                     label_file = img_name.replace(".jpg", ".txt")
                     with open(os.path.join(self.feedback_dataset_root, img_name), "wb") as f:
@@ -129,18 +136,23 @@ class Miner(BaseMinerNeuron):
                     with open(os.path.join(self.feedback_dataset_root, label_file), "w") as f:
                         f.write(f"{ft},{rp}")
 
-                # Fine-tune
-                feedback_dataset = FeedbackDataset([
-                    {"image_bytes": img, "true_fruit_type": ft, "true_ripeness": rp}
-                    for img, ft, rp in feedback_list
-                ], transform=self.transform)
-                loader = DataLoader(feedback_dataset, batch_size=16, shuffle=True)
+                    valid_feedback.append((img_bytes, ft, rp))
 
-                with self.model_lock:
-                    self.train_model(self.model, loader, epochs=1, lr=1e-5)
-                    self.save_model()
+                if valid_feedback:
+                    # Fine-tune
+                    feedback_dataset = FeedbackDataset([
+                        {"image_bytes": img, "true_fruit_type": ft, "true_ripeness": rp}
+                        for img, ft, rp in feedback_list
+                    ], transform=self.transform)
+                    loader = DataLoader(feedback_dataset, batch_size=16, shuffle=True)
 
-                bt.logging.info("Fine-tuning complete. Weights saved.")
+                    with self.model_lock:
+                        self.train_model(self.model, loader, epochs=1, lr=1e-5)
+                        self.save_model()
+
+                    bt.logging.info("Fine-tuning complete. Weights saved.")
+                else:
+                    bt.logging.warning("No valid feedback to fine-tune.")
 
             time.sleep(5)
 
@@ -153,6 +165,7 @@ class Miner(BaseMinerNeuron):
             if not img_bytes:
                 synapse.fruit_type_prediction = "Error: No image"
                 synapse.ripeness_prediction = "Error: No image"
+                bt.logging.error(f"Error: No image data found in synapse {synapse.request_id}")
                 return synapse
 
             # Cache for feedback
@@ -174,6 +187,7 @@ class Miner(BaseMinerNeuron):
 
         except Exception as e:
             bt.logging.error(f"Prediction error: {e}")
+        bt.logging.info(f"Response: ReqNo: {synapse.request_id}, Fruit: {synapse.fruit_type_prediction}, Ripeness: {synapse.ripeness_prediction}")
         return synapse
 
     # ----------------------------
@@ -183,32 +197,13 @@ class Miner(BaseMinerNeuron):
         img_bytes = self.image_cache.get(synapse.request_id)
         if img_bytes:
             self.feedback_buffer.append((img_bytes, synapse.true_fruit_type, synapse.true_ripeness))
-            bt.logging.info(f"Feedback added. Buffer size: {len(self.feedback_buffer)}")
+            bt.logging.info(f"Feedback added. Buffer size: {len(self.feedback_buffer)}, Request ID: {synapse.request_id} - Fruit: {synapse.true_fruit_type}, Ripeness: {synapse.true_ripeness}")
         else:
             bt.logging.warning(f"No image found for feedback {synapse.request_id}")
         return synapse
 
 
 if __name__ == "__main__":
-    # with Miner() as miner:
-    #     bt.logging.info("Running miner on subnet %d"%miner.config.netuid)
-    #     last_block = 0
-    #     while True:
-    #         if miner.block % 5 == 0 and miner.block > last_block:
-    #             log = (
-    #                 f"Block: {miner.block} | " +
-    #                 "Stake:%.02f | "%(miner.metagraph.S[miner.uid]) +
-    #                 "Rank:%.04f | "%miner.metagraph.R[miner.uid] +
-    #                 "Trust:%.04f | "%miner.metagraph.T[miner.uid] +
-    #                 "Consensus:%.04f | "%miner.metagraph.C[miner.uid] +
-    #                 "Incentive:%.04f | "%miner.metagraph.I[miner.uid] +
-    #                 "Emission:%.04f"%miner.metagraph.E[miner.uid]
-    #             )
-    #             bt.logging.info(log)
-    #         last_block = miner.block
-    #         # bt.logging.info("Miner running...", time.time())
-    #         time.sleep(5)
-
     with Miner() as miner:
         bt.logging.info(f"Running miner on subnet {miner.config.netuid}")
         last_block = 0

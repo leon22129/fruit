@@ -55,21 +55,24 @@ with open(path.join(here, "README.md"), encoding="utf-8") as f:
 
 # loading version from setup.py
 with codecs.open(
-    os.path.join(here, "template/__init__.py"), encoding="utf-8"
+    os.path.join(here, "FruitsMaturityNet/__init__.py"), encoding="utf-8"
 ) as init_file:
     version_match = re.search(
         r"^__version__ = ['\"]([^'\"]*)['\"]", init_file.read(), re.M
     )
-    version_string = version_match.group(1)
+    if version_match:
+        version_string = version_match.group(1)
+    else:
+        version_string = "1.0.0"  # fallback version
 
 setup(
-    name="bittensor_subnet_template",  # TODO(developer): Change this value to your module subnet name.
+    name="FruitsMaturityNet",  # TODO(developer): Change this value to your module subnet name.
     version=version_string,
-    description="bittensor_subnet_template",  # TODO(developer): Change this value to your module subnet description.
+    description="FruitsMaturityNet",  # TODO(developer): Change this value to your module subnet description.
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/opentensor/bittensor-subnet-template",  # TODO(developer): Change this url to your module subnet github url.
-    author="bittensor.com",  # TODO(developer): Change this value to your module subnet author name.
+    url="https://github.com/leon22129/fruit",  # TODO(developer): Change this url to your module subnet github url.
+    author="Leon",  # TODO(developer): Change this value to your module subnet author name.
     packages=find_packages(),
     include_package_data=True,
     author_email="",  # TODO(developer): Change this value to your module subnet author email.

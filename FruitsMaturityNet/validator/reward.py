@@ -44,8 +44,7 @@ def reward(response: FruitPrediction, true_fruit_type: str, true_ripeness: str) 
 
 def get_rewards(
     self,
-    query_uids: torch.LongTensor,
-    responses: List[FruitPrediction],
+    responses,
     true_fruit_type: str,
     true_ripeness: str,
 ) -> torch.Tensor:

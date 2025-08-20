@@ -1,122 +1,155 @@
-# Copyright © 2023 Bittensor. All rights reserved.
-
-from FruitsMaturityNet.validator.reward import get_rewards
+import random
+import uuid
 import bittensor as bt
 import torch
-import uuid
-import random
-import io
-import torchvision.transforms as transforms
-from typing import List, Tuple, Dict, Any
-from torch.utils.data import DataLoader
+from typing import List
+from FruitsMaturityNet.protocol import FruitPrediction, FeedbackSynapse
+from FruitsMaturityNet.validator.reward import get_rewards
 
-from FruitsMaturityNet.protocol import FruitPrediction
-from FruitsMaturityNet.model import FRUIT_TYPE_MAP, RIPENESS_MAP
-from FruitsMaturityNet.dataset import FruitDataset
+# keep a generator or list of image paths globally in the validator
+if not hasattr(bt, "_test_image_iterator"):
+    import os
+    test_root = "dataset/test"
+    all_image_paths = []
 
+    for class_dir in os.listdir(test_root):
+        full_class_path = os.path.join(test_root, class_dir)
+        if not os.path.isdir(full_class_path):
+            continue
+        for file in os.listdir(full_class_path):
+            full_path = os.path.join(full_class_path, file)
+            all_image_paths.append((full_path, class_dir))
 
-def get_random_image_data(dataloader, data_iterator) -> Tuple[bytes, str, str, Any]:
-    """Gets a random image and its true labels from the dataset."""
-    try:
-        sample = next(data_iterator)
-    except StopIteration:
-        # Reset iterator if all samples are consumed
-        data_iterator = iter(dataloader)
-        sample = next(data_iterator)
+    # Shuffle for randomness
+    random.shuffle(all_image_paths)
+    bt._test_image_iterator = iter(all_image_paths)
 
-    image_tensor = sample["image"].squeeze(0)  # Remove batch dimension
-    fruit_type_label_id = sample["fruit_type_label"].item()
-    ripeness_label_id = sample["ripeness_label"].item()
-
-    # Convert tensor to PIL Image and then to bytes
-    to_pil = transforms.ToPILImage()
-    image_pil = to_pil(image_tensor)
-    img_byte_arr = io.BytesIO()
-    image_pil.save(img_byte_arr, format='JPEG')
-    image_bytes = img_byte_arr.getvalue()
-
-    true_fruit_type = FRUIT_TYPE_MAP.get(fruit_type_label_id, "Unknown")
-    true_ripeness = RIPENESS_MAP.get(ripeness_label_id, "Normal")
-
-    return image_bytes, true_fruit_type, true_ripeness, data_iterator
-
-
-def forward(self):
-    """
-    The forward function is called by the validator every time step.
-    
-    It is responsible for querying the network and scoring the responses.
-    
+def check_uid_availability(
+    metagraph: "bt.metagraph.Metagraph", uid: int, vpermit_tao_limit: int
+) -> bool:
+    """Check if uid is available. The UID should be available if it is serving and has less than vpermit_tao_limit stake
     Args:
-        self (:obj:`bittensor.neuron.Neuron`): The neuron object which contains all the necessary state for the validator.
-    
+        metagraph (:obj: bt.metagraph.Metagraph): Metagraph object
+        uid (int): uid to be checked
+        vpermit_tao_limit (int): Validator permit tao limit
+    Returns:
+        bool: True if uid is available, False otherwise
     """
-    # Get all active miners
-    miner_uids = self.metagraph.uids.to(self.device)
-    
-    # Filter for active miners
-    active_miners = []
-    for uid in miner_uids:
-        if self.metagraph.axons[uid].is_serving:
-            active_miners.append(uid.item())
+    # TODO: Check if is_serving is still relevant
+    # Filter non serving axons.
+    if not metagraph.axons[uid].is_serving:
+        return False
+    # Filter validator permit > 1024 stake.
+    if metagraph.validator_permit[uid]:
+        if metagraph.S[uid] > vpermit_tao_limit:
+            return False
+    # Available otherwise.
+    return True
 
-    if len(active_miners) < self.config.neuron.min_axon_size:
-        bt.logging.warning(f"Not enough active miners ({len(active_miners)}/{self.config.neuron.min_axon_size}). Waiting...")
+def get_miner_uids(
+    self, exclude: List[int] = None
+) -> torch.LongTensor:
+    """Returns k available random uids from the metagraph.
+    Args:
+        k (int): Number of uids to return.
+        exclude (List[int]): List of uids to exclude from the random sampling.
+    Returns:
+        uids (torch.LongTensor): Randomly sampled available uids.
+    Notes:
+        If `k` is larger than the number of available `uids`, set `k` to the number of available `uids`.
+    """
+    candidate_uids = []
+    avail_uids = []
+
+    for uid in range(self.metagraph.n.item()):
+        uid_is_available = check_uid_availability(
+            self.metagraph, uid, self.config.neuron.vpermit_tao_limit
+        )
+        uid_is_not_excluded = exclude is None or uid not in exclude
+
+        if uid_is_available:
+            avail_uids.append(uid)
+            if uid_is_not_excluded:
+                candidate_uids.append(uid)
+
+    uids = torch.tensor(candidate_uids)
+    return uids
+
+async def forward(self):
+    try:
+        # Get next image
+        img_path, class_dir = next(bt._test_image_iterator)
+    except StopIteration:
+        bt.logging.info("No more test images left!")
         return
 
-    # Select a random subset of miners to query
-    query_uids = torch.tensor(random.sample(active_miners, min(len(active_miners), 10)))
-    query_axons = [self.metagraph.axons[uid] for uid in query_uids]
+    # Extract labels from directory name
+    raw_label = class_dir.lower()
+    state = "fresh" if "Fresh" in raw_label else "Rotten"
+    if "apple" in raw_label:
+        fruit = "Apple"
+    elif "banana" in raw_label:
+        fruit = "Banana"
+    elif "orange" in raw_label:
+        fruit = "Orange"
+    else:
+        fruit = "unknown"
 
-    # Prepare the request
-    request_id = str(uuid.uuid4())
-    image_bytes, true_fruit_type, true_ripeness, self.data_iterator = get_random_image_data(
-        self.dataloader, self.data_iterator
-    )
-    
-    synapse = FruitPrediction(request_id=request_id)
-    synapse.encode_image(image_bytes)
+    labels = [state, fruit]
+    bt.logging.info(f"Sending image {img_path} with labels {labels}")
 
-    bt.logging.info(f"Sending request {request_id} to {len(query_axons)} miners. Original labels: {true_fruit_type}, {true_ripeness}")
+    try:
+        # Load image and encode
+        img_bytes = open(img_path, "rb").read()
+        synapse = FruitPrediction(
+            request_id=str(uuid.uuid4())
+        )
+        synapse.encode_image(img_bytes)
 
-    # Send the request to miners
-    responses: List[FruitPrediction] = self.dendrite.query(
-        query_axons,
-        synapse,
-        timeout=12,
-        deserialize=False,
-    )
+        miner_uids = get_miner_uids(self)
 
-    # Process responses and collect valid ones
-    miner_responses_info = {}
-    valid_responses = []
-    valid_uids = []
-    
-    for i, response in enumerate(responses):
-        if response.fruit_type_prediction is not None and response.ripeness_prediction is not None:
-            valid_responses.append(response)
-            valid_uids.append(query_uids[i])
-            miner_responses_info[query_uids[i].item()] = response.deserialize()
-        else:
-            bt.logging.warning(f"Miner {query_uids[i].item()} returned invalid response")
+        bt.logging.info(f"valid miners {miner_uids}")
 
-    if not valid_responses:
-        bt.logging.warning("No valid responses received from miners.")
-        return
+        # Send through dendrite
+        responses = await self.dendrite(
+            axons=[self.metagraph.axons[uid] for uid in miner_uids],
+            synapse=synapse
+        )
 
-    # Log the request for manual feedback
-    self.log_feedback_request(request_id, image_bytes, true_fruit_type, true_ripeness, miner_responses_info)
+        responses_objs: List[FruitPrediction] = [
+            FruitPrediction.from_dict(r) if isinstance(r, dict) else r
+            for r in responses
+        ]
 
-    # Calculate rewards using the reward function
-    rewards = get_rewards(
-        self,
-        query_uids=torch.LongTensor(valid_uids),
-        responses=valid_responses,
-        true_fruit_type=true_fruit_type,
-        true_ripeness=true_ripeness,
-    )
+        bt.logging.info(f"Received responses for {img_path}: {responses}")
 
-    bt.logging.info(f"Scored responses: {rewards}")
-    
-    # Update the scores based on the rewards
-    self.update_scores(rewards, torch.tensor(valid_uids))
+        # Send feedback
+        feedback_synapse = FeedbackSynapse(
+            request_id=synapse.request_id,
+            # true_fruit_type=fruit,
+            # true_ripeness=state
+        )
+
+        await self.dendrite(
+            axons=[self.metagraph.axons[uid] for uid in miner_uids],
+            synapse=feedback_synapse
+        )
+
+        rewards = get_rewards(self, responses_objs, fruit, state)
+
+        # Ensure self.scores is CPU NumPy array
+        if isinstance(self.scores, torch.Tensor):
+            self.scores = self.scores.detach().cpu().numpy()
+
+        # Convert rewards to CPU NumPy array
+        rewards_np = rewards.detach().cpu().numpy()
+
+        # Convert miner UIDs to CPU NumPy array
+        miner_uids_np = torch.LongTensor(miner_uids).cpu().numpy()
+
+        # Update scores
+        self.update_scores(rewards_np, miner_uids_np)
+
+    except Exception as e:
+        bt.logging.error(f"Error forwarding {img_path}: {e}")
+
