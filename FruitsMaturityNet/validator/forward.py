@@ -5,6 +5,7 @@ import torch
 from typing import List
 from FruitsMaturityNet.protocol import FruitPrediction, FeedbackSynapse
 from FruitsMaturityNet.validator.reward import get_rewards
+from FruitsMaturityNet.utils.uids import get_miner_uids
 
 # keep a generator or list of image paths globally in the validator
 if not hasattr(bt, "_test_image_iterator"):
@@ -46,34 +47,7 @@ def check_uid_availability(
     # Available otherwise.
     return True
 
-def get_miner_uids(
-    self, exclude: List[int] = None
-) -> torch.LongTensor:
-    """Returns k available random uids from the metagraph.
-    Args:
-        k (int): Number of uids to return.
-        exclude (List[int]): List of uids to exclude from the random sampling.
-    Returns:
-        uids (torch.LongTensor): Randomly sampled available uids.
-    Notes:
-        If `k` is larger than the number of available `uids`, set `k` to the number of available `uids`.
-    """
-    candidate_uids = []
-    avail_uids = []
 
-    for uid in range(self.metagraph.n.item()):
-        uid_is_available = check_uid_availability(
-            self.metagraph, uid, self.config.neuron.vpermit_tao_limit
-        )
-        uid_is_not_excluded = exclude is None or uid not in exclude
-
-        if uid_is_available:
-            avail_uids.append(uid)
-            if uid_is_not_excluded:
-                candidate_uids.append(uid)
-
-    uids = torch.tensor(candidate_uids)
-    return uids
 
 async def forward(self):
     try:
@@ -98,58 +72,56 @@ async def forward(self):
     labels = [state, fruit]
     bt.logging.info(f"Sending image {img_path} with labels {labels}")
 
-    try:
+    # try:
         # Load image and encode
-        img_bytes = open(img_path, "rb").read()
-        synapse = FruitPrediction(
-            request_id=str(uuid.uuid4())
-        )
-        synapse.encode_image(img_bytes)
+    img_bytes = open(img_path, "rb").read()
+    synapse = FruitPrediction(
+        request_id=str(uuid.uuid4())
+    )
+    synapse.encode_image(img_bytes)
 
-        miner_uids = get_miner_uids(self)
+    miner_uids = get_miner_uids(self)
 
-        bt.logging.info(f"valid miners {miner_uids}")
+    bt.logging.info(f"valid miners {miner_uids}")
 
-        # Send through dendrite
-        responses = await self.dendrite(
-            axons=[self.metagraph.axons[uid] for uid in miner_uids],
-            synapse=synapse
-        )
+    responses = await self.dendrite(
+        axons=[self.metagraph.axons[uid] for uid in miner_uids],
+        synapse=synapse
+    )
 
-        responses_objs: List[FruitPrediction] = [
-            FruitPrediction.from_dict(r) if isinstance(r, dict) else r
-            for r in responses
-        ]
+    bt.logging.info(f"Received responses for {img_path}: {responses}")
 
-        bt.logging.info(f"Received responses for {img_path}: {responses}")
+    responses_objs: List[FruitPrediction] = [
+        FruitPrediction.from_dict(r) for r in responses
+    ]
 
-        # Send feedback
-        feedback_synapse = FeedbackSynapse(
-            request_id=synapse.request_id,
-            # true_fruit_type=fruit,
-            # true_ripeness=state
-        )
+    # Send feedback
+    feedback_synapse = FeedbackSynapse(
+        request_id=synapse.request_id,
+        true_fruit_type=fruit,
+        true_ripeness=state
+    )
 
-        await self.dendrite(
-            axons=[self.metagraph.axons[uid] for uid in miner_uids],
-            synapse=feedback_synapse
-        )
+    await self.dendrite(
+        axons=[self.metagraph.axons[uid] for uid in miner_uids],
+        synapse=feedback_synapse
+    )
 
-        rewards = get_rewards(self, responses_objs, fruit, state)
+    rewards = get_rewards(self, responses_objs, fruit, state)
 
-        # Ensure self.scores is CPU NumPy array
-        if isinstance(self.scores, torch.Tensor):
-            self.scores = self.scores.detach().cpu().numpy()
+    # Ensure self.scores is CPU NumPy array
+    if isinstance(self.scores, torch.Tensor):
+        self.scores = self.scores.detach().cpu().numpy()
 
-        # Convert rewards to CPU NumPy array
-        rewards_np = rewards.detach().cpu().numpy()
+    # Convert rewards to CPU NumPy array
+    rewards_np = rewards.detach().cpu().numpy()
 
-        # Convert miner UIDs to CPU NumPy array
-        miner_uids_np = torch.LongTensor(miner_uids).cpu().numpy()
+    # Convert miner UIDs to CPU NumPy array
+    miner_uids_np = torch.LongTensor(miner_uids).cpu().numpy()
 
-        # Update scores
-        self.update_scores(rewards_np, miner_uids_np)
+    # Update scores
+    self.update_scores(rewards_np, miner_uids_np)
 
-    except Exception as e:
-        bt.logging.error(f"Error forwarding {img_path}: {e}")
+    # except Exception as e:
+    #     bt.logging.error(f"Error forwarding {img_path}: {e}")
 
